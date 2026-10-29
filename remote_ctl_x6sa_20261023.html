@@ -1,0 +1,202 @@
+// ============================================================
+// 远程遥控 · HTTP 轮询版（Auto.js 4.1.1 / Android 5.1）
+// 目标机型：vivo X6s A（SDK_INT=22，1080x1920）
+//
+// 原理：本机没有 root / 不能 dispatchGesture，划屏只能走
+//       无障碍 scrollForward()。脚本每隔 POLL 毫秒向 PC 拉一条
+//       指令执行，执行完把结果回报给 PC，等价于"准 SSH"。
+//
+// 启动前：设置 → 辅助功能 → 开启 AutoJs 无障碍服务
+// 停止：音量减键，或在 PC 侧下发 cmd=stop
+//
+// 指令：up / down / tap(文字) / back / home / recents / status / stop
+// ============================================================
+
+// ==================== 配置 ====================
+var PC = "http://172.20.36.178:8000";  // PC 服务端地址（改了 IP 要同步改这里）
+var POLL = 500;                        // 轮询间隔(ms)
+var HB_EVERY = 60000;                  // 心跳回报间隔(ms)
+var REPEAT_MAX = 10;                   // 单条指令最多重复次数
+
+// ==================== HTTP 工具 ====================
+function httpText(path) {
+    var r = null;
+    try {
+        var sep = (path.indexOf("?") >= 0) ? "&" : "?";
+        r = http.get(PC + path + sep + "_t=" + Date.now(), {
+            headers: { "Cache-Control": "no-cache" }
+        });
+        if (!r) return null;
+        if (r.statusCode !== 200) return null;
+        return r.body.string();
+    } catch (e) {
+        return null;
+    }
+}
+
+function ack(msg) {
+    try {
+        httpText("/ack?msg=" + encodeURIComponent(msg));
+    } catch (e) {}
+    console.log(msg);
+}
+
+// ==================== 节点工具 ====================
+function shortName(cls) {
+    if (!cls) return "?";
+    var p = String(cls).split(".");
+    return p[p.length - 1];
+}
+
+function pushCand(list, seen, nd) {
+    if (!nd) return;
+    var cls = "?", area = 0, sb = false;
+    try { cls = shortName(nd.className()); } catch (e) {}
+    try { sb = nd.scrollable(); } catch (e) {}
+    try {
+        var b = nd.bounds();
+        if (b) area = Math.max(0, b.width()) * Math.max(0, b.height());
+    } catch (e) {}
+    var key = cls + "|" + area;
+    if (seen[key]) return;
+    seen[key] = true;
+    list.push({ node: nd, cls: cls, area: area, sb: sb });
+}
+
+// 收集候选滚动容器：官方 scrollable 标记 + 类名兜底
+function scrollCands() {
+    var cands = [], seen = {};
+    try {
+        var nodes = scrollable(true).find();
+        var n = (nodes && nodes.size) ? nodes.size : 0;
+        for (var i = 0; i < n; i++) pushCand(cands, seen, nodes.get(i));
+    } catch (e) {}
+
+    try {
+        var like = classNameMatches(".*(Pager|RecyclerView|ScrollView|ListView|WebView).*").find();
+        var m = (like && like.size) ? like.size : 0;
+        for (var j = 0; j < m && j < 20; j++) pushCand(cands, seen, like.get(j));
+    } catch (e) {}
+    return cands;
+}
+
+// 执行一次滚动，forward=true 上滑(下一个)，false 下滑(上一个)
+function doScroll(forward) {
+    var cands = scrollCands();
+    if (!cands.length) return "失败:无候选节点";
+    for (var i = 0; i < cands.length; i++) {
+        var ok = false;
+        try {
+            ok = forward ? cands[i].node.scrollForward() : cands[i].node.scrollBackward();
+        } catch (e) {
+            ok = false;
+        }
+        if (ok) return "成功:" + cands[i].cls + "(" + cands[i].area + ")";
+    }
+    return "失败:" + cands.length + "个候选均无响应";
+}
+
+// ==================== 指令执行 ====================
+function wake() {
+    try { device.wakeUpIfNeeded(); } catch (e) {
+        try { device.wakeUp(); } catch (e2) {}
+    }
+    try { device.keepScreenOn(10 * 60 * 1000); } catch (e) {}
+}
+
+function doTap(arg) {
+    if (!arg) return "失败:tap 缺少文字参数";
+    var nd = null;
+    try { nd = text(arg).findOne(1500); } catch (e) {}
+    if (!nd) { try { nd = desc(arg).findOne(1000); } catch (e) {} }
+    if (!nd) return "失败:找不到文字=" + arg;
+    var ok = false;
+    try { ok = nd.click(); } catch (e) {}
+    return (ok ? "成功:点击 " : "失败:点击 ") + arg;
+}
+
+function run(cmd, arg) {
+    wake();
+    if (cmd === "up") {
+        var n = parseInt(arg, 10);
+        if (!n || n < 1) n = 1;
+        if (n > REPEAT_MAX) n = REPEAT_MAX;
+        var last = "";
+        for (var i = 0; i < n; i++) {
+            last = doScroll(true);
+            if (last.indexOf("失败") === 0) break;
+            if (i < n - 1) sleep(800);
+        }
+        return last;
+    }
+    if (cmd === "down") return doScroll(false);
+    if (cmd === "tap") return doTap(arg);
+    if (cmd === "back") { try { back(); return "成功:back"; } catch (e) { return "失败:back"; } }
+    if (cmd === "home") { try { home(); return "成功:home"; } catch (e) { return "失败:home"; } }
+    if (cmd === "recents") { try { recents(); return "成功:recents"; } catch (e) { return "失败:recents"; } }
+    if (cmd === "status") {
+        var w = 0, h = 0;
+        try { w = device.width; h = device.height; } catch (e) {}
+        return "前台=" + currentPackage() + " 屏幕=" + w + "x" + h +
+               " 服务=" + (auto.service ? "开" : "关") + " 候选=" + scrollCands().length;
+    }
+    return "失败:未知指令 " + cmd;
+}
+
+// ==================== 停止控制（音量减键） ====================
+var stopped = false;
+try {
+    events.observeKey();
+    events.onKeyDown("volume_down", function (event) {
+        stopped = true;
+        ack("本地停止:音量减键");
+        engines.stopAll();
+        event.consumed = true;
+    });
+} catch (e) {}
+
+// ==================== 启动检查 ====================
+if (!auto.service) {
+    toast("无障碍服务未开启！设置→辅助功能→AutoJs");
+    exit();
+}
+toast("遥控已启动 | 轮询 " + PC);
+ack("上线 seq=0 脚本=" + "remote_ctl_x6sa_20261023.js");
+
+// ==================== 主循环 ====================
+var lastHb = Date.now();
+var loopCount = 0;
+
+while (!stopped) {
+    loopCount++;
+
+    // 心跳：证明链路存活（PC 侧不接管时也能看出手机在线）
+    if (Date.now() - lastHb >= HB_EVERY) {
+        lastHb = Date.now();
+        ack("hb 循环=" + loopCount + " 前台=" + currentPackage());
+    }
+
+    var body = httpText("/cmd");
+    if (body) {
+        var obj = null;
+        try { obj = JSON.parse(body); } catch (e) {}
+        if (obj && obj.cmd) {
+            if (obj.cmd === "stop") {
+                ack("远端停止 seq=" + obj.seq);
+                toast("收到远端停止");
+                break;
+            }
+            var res = "";
+            try {
+                res = run(obj.cmd, obj.arg);
+            } catch (e2) {
+                res = "异常:" + e2;
+            }
+            ack("seq=" + obj.seq + " cmd=" + obj.cmd + " => " + res);
+        }
+    }
+
+    sleep(POLL);
+}
+
+ack("脚本已退出");

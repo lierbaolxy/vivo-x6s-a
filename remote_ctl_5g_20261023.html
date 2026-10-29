@@ -1,0 +1,276 @@
+// ============================================================
+// 远程遥控 · 第 2 台（5G 手机）
+// 目标机型：Bingo 5G，真实 Android 6.0（SDK_INT=23），屏幕 480x1014
+//   界面显示"8.3"是伪造版本号；SDK 23 仍不支持 dispatchGesture，
+//   所以同 X6s A 一样只能走无障碍 scrollForward。
+//
+// 本机与 X6s A 完全独立：连的是 PC 的 8001 端口，
+// X6s A 连的是 8000 端口，两个服务端各跑各的，互不抢指令。
+//
+// 启动前：设置 → 辅助功能 → 开启 AutoJs 无障碍服务
+// 停止：音量减键，或 PC 侧 cmd=stop
+//
+// 指令：scan / dump / up / down / tap / back / home / recents / status / stop
+// ============================================================
+
+// ==================== 配置 ====================
+var PC = "http://172.20.36.178:8001";   // 8001 = 这台手机专属端口
+var POLL = 500;
+var CACHE_MS = 5000;
+var MAX_SCAN = 300;
+var HB_EVERY = 60000;
+
+// 用于定位树根的种子文字（哪个存在用哪个）
+var SEEDS = ["我", "首页", "精选", "同城", "关注", "推荐", "发现", "消息", "朋友", "直播"];
+
+// ==================== HTTP ====================
+function httpText(path) {
+    var r = null;
+    try {
+        var sep = (path.indexOf("?") >= 0) ? "&" : "?";
+        r = http.get(PC + path + sep + "_t=" + Date.now(), {
+            headers: { "Cache-Control": "no-cache" }
+        });
+        if (!r || r.statusCode !== 200) return null;
+        return r.body.string();
+    } catch (e) {
+        return null;
+    }
+}
+
+// 长文本回报：Auto.js 4.1.1 的 http.post 会按字符拆包，服务端已做还原
+function ack(msg) {
+    try {
+        http.post(PC + "/ack", msg, {
+            headers: { "Content-Type": "text/plain; charset=utf-8" }
+        });
+    } catch (e) {}
+    console.log(msg.substring(0, 160));
+}
+
+// ==================== 节点工具 ====================
+function shortName(cls) {
+    if (!cls) return "?";
+    var p = String(cls).split(".");
+    return p[p.length - 1];
+}
+
+function nodeInfo(nd, depth) {
+    var w = 0, h = 0, area = 0, sb = false, cls = "?", kids = 0, txt = "", dsc = "";
+    try {
+        var b = nd.bounds();
+        if (b) { w = b.width(); h = b.height(); area = Math.max(0, w) * Math.max(0, h); }
+    } catch (e) {}
+    try { sb = nd.scrollable(); } catch (e) {}
+    try { cls = shortName(nd.className()); } catch (e) {}
+    try { kids = nd.childCount(); } catch (e) {}
+    try { txt = nd.text() || ""; } catch (e) {}
+    try { dsc = nd.desc() || ""; } catch (e) {}
+    return { node: nd, cls: cls, w: w, h: h, area: area,
+             sb: sb, kids: kids, txt: txt, dsc: dsc, depth: depth };
+}
+
+function seedNode() {
+    for (var i = 0; i < SEEDS.length; i++) {
+        var nd = null;
+        try { nd = text(SEEDS[i]).findOne(900); } catch (e) {}
+        if (!nd) { try { nd = desc(SEEDS[i]).findOne(700); } catch (e) {} }
+        if (nd) return nd;
+    }
+    return null;
+}
+
+function climbToRoot(nd) {
+    var cur = nd, depth = 0;
+    while (cur && depth < 80) {
+        var p = null;
+        try { p = cur.parent(); } catch (e) { p = null; }
+        if (!p) break;
+        cur = p;
+        depth++;
+    }
+    return cur;
+}
+
+// 广度优先遍历整棵树（child(i) 方式，不用 classNameMatches 选择器）
+function bfs(root, maxNodes) {
+    var out = [], queue = [{ n: root, d: 0 }], guard = 0;
+    while (queue.length > 0 && out.length < maxNodes && guard < 1200) {
+        guard++;
+        var it = queue.shift();
+        var info = nodeInfo(it.n, it.d);
+        if (info.area > 0 || it.d === 0) out.push(info);
+        var k = 0;
+        try { k = it.n.childCount(); } catch (e) { k = 0; }
+        for (var i = 0; i < k; i++) {
+            var c = null;
+            try { c = it.n.child(i); } catch (e) { c = null; }
+            if (c) queue.push({ n: c, d: it.d + 1 });
+        }
+    }
+    return out;
+}
+
+var cache = { t: 0, nodes: [], seed: null };
+
+function collectFresh() {
+    var seed = seedNode();
+    if (!seed) return { nodes: [], seed: null };
+    var root = climbToRoot(seed);
+    if (!root) return { nodes: [], seed: "种子有/根失败" };
+    var nodes = bfs(root, MAX_SCAN);
+    return { nodes: nodes, seed: "ok" };
+}
+
+function nodesCached() {
+    if (Date.now() - cache.t < CACHE_MS && cache.nodes.length) return cache.nodes;
+    var r = collectFresh();
+    cache.nodes = r.nodes;
+    cache.seed = r.seed;
+    cache.t = Date.now();
+    return cache.nodes;
+}
+
+// ==================== 滚动 ====================
+function tryScroll(forward) {
+    var nodes = nodesCached();
+    if (!nodes.length) return "失败:取树失败 种子=" + (cache.seed || "null");
+
+    var sw = 0, sh = 0;
+    try { sw = device.width; sh = device.height; } catch (e) {}
+    var minArea = sw * sh * 0.30;
+
+    var idx = [];
+    for (var i = 0; i < nodes.length; i++) idx.push(i);
+    idx.sort(function (a, b) {
+        var sa = nodes[a].sb ? 1 : 0, sb2 = nodes[b].sb ? 1 : 0;
+        if (sa !== sb2) return sb2 - sa;
+        return nodes[b].area - nodes[a].area;
+    });
+
+    var tried = 0;
+    for (var pass = 0; pass < 2; pass++) {
+        for (var m = 0; m < idx.length; m++) {
+            var nd = nodes[idx[m]];
+            if (pass === 0 && nd.area < minArea) continue;
+            tried++;
+            var ok = false;
+            try { ok = forward ? nd.node.scrollForward() : nd.node.scrollBackward(); } catch (e) {}
+            if (ok) {
+                return "成功:" + nd.cls + "(" + nd.w + "x" + nd.h + ",sb=" + nd.sb +
+                       ",d=" + nd.depth + ") 第" + tried + "次/共" + nodes.length + "节点";
+            }
+        }
+    }
+    return "失败:遍历" + nodes.length + "节点/试" + tried + "次 种子=" + (cache.seed || "null");
+}
+
+// ==================== 指令 ====================
+function wake() {
+    try { device.wakeUpIfNeeded(); } catch (e) {
+        try { device.wakeUp(); } catch (e2) {}
+    }
+    try { device.keepScreenOn(10 * 60 * 1000); } catch (e) {}
+}
+
+function dumpStr() {
+    var nodes = nodesCached();
+    var lim = nodes.length < 80 ? nodes.length : 80;
+    var parts = [];
+    for (var i = 0; i < lim; i++) {
+        var n = nodes[i];
+        var extra = "";
+        if (n.txt) extra += " t=" + n.txt;
+        if (n.dsc) extra += " d=" + n.dsc;
+        parts.push(i + " d" + n.depth + " " + n.cls + " sb=" + (n.sb ? 1 : 0) +
+                   " " + n.w + "x" + n.h + " k=" + n.kids + extra);
+    }
+    return "DUMP 总=" + nodes.length + " 种子=" + (cache.seed || "null") +
+           " 前台=" + currentPackage() + "\n" + parts.join("\n");
+}
+
+function doTap(arg) {
+    if (!arg) return "失败:tap 缺少文字";
+    var nd = null;
+    try { nd = text(arg).findOne(1500); } catch (e) {}
+    if (!nd) { try { nd = desc(arg).findOne(1000); } catch (e) {} }
+    if (!nd) return "失败:找不到文字=" + arg;
+    var ok = false;
+    try { ok = nd.click(); } catch (e) {}
+    return (ok ? "成功:点击 " : "失败:点击(节点存在但click=false) ") + arg;
+}
+
+function run(cmd, arg) {
+    if (cmd === "dump") return dumpStr();
+    if (cmd === "scan") {
+        var r = collectFresh();
+        cache.nodes = r.nodes; cache.seed = r.seed; cache.t = Date.now();
+        return "节点数=" + r.nodes.length + " 种子=" + (r.seed || "null") +
+               " 前台=" + currentPackage();
+    }
+    wake();
+    if (cmd === "up") return tryScroll(true);
+    if (cmd === "down") return tryScroll(false);
+    if (cmd === "tap") return doTap(arg);
+    if (cmd === "back") { try { back(); return "成功:back"; } catch (e) { return "失败:back"; } }
+    if (cmd === "home") { try { home(); return "成功:home"; } catch (e) { return "失败:home"; } }
+    if (cmd === "recents") { try { recents(); return "成功:recents"; } catch (e) { return "失败:recents"; } }
+    if (cmd === "status") {
+        var w = 0, h = 0;
+        try { w = device.width; h = device.height; } catch (e) {}
+        return "前台=" + currentPackage() + " 屏幕=" + w + "x" + h +
+               " 服务=" + (auto.service ? "开" : "关") + " 缓存=" + cache.nodes.length +
+               " 种子=" + (cache.seed || "null");
+    }
+    return "失败:未知指令 " + cmd;
+}
+
+// ==================== 停止键 ====================
+var stopped = false;
+try {
+    events.observeKey();
+    events.onKeyDown("volume_down", function (event) {
+        stopped = true;
+        ack("本地停止:音量减键");
+        engines.stopAll();
+        event.consumed = true;
+    });
+} catch (e) {}
+
+// ==================== 启动 ====================
+if (!auto.service) {
+    toast("无障碍服务未开启！设置→辅助功能→AutoJs");
+    exit();
+}
+toast("5G 遥控已启动");
+ack("上线 5G 脚本=remote_ctl_5g_20261023.js 端口8001");
+
+// ==================== 主循环 ====================
+var lastHb = Date.now();
+var loopCount = 0;
+
+while (!stopped) {
+    loopCount++;
+    if (Date.now() - lastHb >= HB_EVERY) {
+        lastHb = Date.now();
+        ack("hb 5G 循环=" + loopCount + " 前台=" + currentPackage());
+    }
+    var body = httpText("/cmd");
+    if (body) {
+        var obj = null;
+        try { obj = JSON.parse(body); } catch (e) {}
+        if (obj && obj.cmd) {
+            if (obj.cmd === "stop") {
+                ack("远端停止 5G seq=" + obj.seq);
+                toast("收到远端停止");
+                break;
+            }
+            var res = "";
+            try { res = run(obj.cmd, obj.arg); } catch (e2) { res = "异常:" + e2; }
+            ack("seq=" + obj.seq + " cmd=" + obj.cmd + " => " + res);
+        }
+    }
+    sleep(POLL);
+}
+
+ack("5G 脚本已退出");

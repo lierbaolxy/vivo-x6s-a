@@ -1,0 +1,94 @@
+// ============================================================
+// 列出手机里所有应用 v2（双通道回传，2026-10-26）
+// 通道1: POST /upload   通道2: GET /put 分段（POST 失败自动切换）
+// 结果同时存: /sdcard/app_list.txt 和 /sdcard/脚本/app_list.txt
+// 退出：音量减键
+// ============================================================
+
+var PC_POST = "http://172.20.36.178:8099/upload";
+var PC_PUT  = "http://172.20.36.178:8099/put";
+
+var lines = [];
+function log(s) { lines.push("" + s); console.log("" + s); }
+
+// ---------- 设备信息 ----------
+try {
+    log("机型: " + device.brand + " " + device.model +
+        " | Android " + device.release + " (SDK" + device.sdkInt + ")");
+} catch (e) { log("设备信息读取失败: " + e); }
+
+// ---------- 应用列表 ----------
+var user = [], sys = [];
+try {
+    var pm = context.getPackageManager();
+    var infos = pm.getInstalledApplications(0);
+    for (var i = 0; i < infos.size(); i++) {
+        var ai = infos.get(i);
+        var label = "", pkg = "?";
+        try { label = String(pm.getApplicationLabel(ai)); } catch (e) {}
+        try { pkg = String(ai.packageName); } catch (e) {}
+        var isSys = false;
+        try { isSys = ((ai.flags & 1) === 1); } catch (e) {}   // FLAG_SYSTEM = 1
+        var row = label + " | " + pkg;
+        if (isSys) sys.push(row); else user.push(row);
+    }
+} catch (e) { log("读取应用列表失败: " + e); }
+
+user.sort(); sys.sort();
+log("共 " + (user.length + sys.length) + " 个应用（用户安装 " + user.length + " / 系统 " + sys.length + "）");
+log("===== 用户安装的应用 =====");
+for (var i = 0; i < user.length; i++) log(user[i]);
+log("===== 系统应用 =====");
+for (var i = 0; i < sys.length; i++) log(sys[i]);
+
+var full = lines.join("\n");
+
+// ---------- 保存两份（存储权限已授予时可用） ----------
+var saved = [];
+var paths = ["/sdcard/app_list.txt", "/sdcard/脚本/app_list.txt"];
+for (var k = 0; k < paths.length; k++) {
+    try { files.write(paths[k], full); saved.push(paths[k]); } catch (e) {}
+}
+log(saved.length ? ("已保存: " + saved.join(" , ")) : "本地保存失败（无存储权限）");
+
+// ---------- 回传：先 POST，失败自动转 GET 分段 ----------
+function upload(text) {
+    try {
+        var r = http.post(PC_POST, text, "text/plain");
+        if (r && r.statusCode === 200) return "POST 成功";
+        log("POST 返回异常: " + (r ? r.statusCode : "null"));
+    } catch (e) {
+        log("POST 异常: " + e);
+    }
+    var CH = 500, total = Math.ceil(text.length / CH), ok = 0;
+    log("转 GET 分段上报，共 " + total + " 段");
+    for (var i = 0; i < total; i++) {
+        var url = PC_PUT + "?i=" + i + "&t=" + total + "&d=" + encodeURIComponent(text.substr(i * CH, CH));
+        try {
+            var r2 = http.get(url);
+            if (r2 && r2.statusCode === 200) ok++;
+            else log("段 " + i + " 返回 " + (r2 ? r2.statusCode : "null"));
+        } catch (e2) {
+            log("段 " + i + " 异常: " + e2);
+        }
+        sleep(100);
+    }
+    return "GET 分段 " + ok + "/" + total;
+}
+
+var rep;
+try { rep = upload(full); } catch (e) { rep = "回传异常: " + e; }
+log("回传结果: " + rep);
+if (rep.indexOf("成功") >= 0 || rep.indexOf(("" + Math.ceil(full.length / 500) + "/" + Math.ceil(full.length / 500))) >= 0) {
+    toast("清单已回传电脑 ✓");
+} else {
+    toast("回传未完成: " + rep);
+}
+
+// ---------- 显示并保持 ----------
+try { console.show(); console.setSize(0.96, 0.6); } catch (e) {}
+toast("列完了，音量减键退出");
+
+events.observeKey();
+events.onKeyDown("volume_down", function (event) { engines.stopAll(); event.consumed = true; });
+while (true) sleep(1000);

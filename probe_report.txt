@@ -1,0 +1,27 @@
+切换等待: 2 秒
+前台包名: com.android.systemui
+当前 Activity: com.android.systemui.recents.RecentsActivity
+屏幕: 480x1014  SDK=23
+无障碍服务: 已连接
+全部节点: 0 个
+标记 scrollable 的节点: 0 个
+--- 前5个 scrollable 节点直接 scrollForward ---
+--- scrollForward 探测(面积前40) ---
+--- performAction(4096) 探测(面积前10) ---
+--- 焦点(64)+滚动(4096) 探测(面积前5) ---
+--- shell 滑动专项 ---
+全局 swipe() => 异常: JavaException: com.stardust.autojs.runtime.exception.ScriptException: 本脚本需要此安卓版本以上才能运行:7.0
+shell input swipe 300ms => code=0 out=[Killed 
+EXIT=137
+]
+shell input touchscreen swipe => code=0 out=[Killed 
+EXIT=137
+]
+shell input keyevent 20(下方向键) => code=0 out=[Killed 
+EXIT=137
+]
+====================
+诊断完成  时间: 2026年9月17日 GMT+00:00 上午9:20:20
+前台: com.android.systemui / com.android.systemui.recents.RecentsActivity
+结论: 无障碍滚动全废，重点看第 ⑦ 段 shell 测试结果
+已保存: /sdcard/autoswipe_probe2.txt

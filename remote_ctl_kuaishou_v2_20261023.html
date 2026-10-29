@@ -1,0 +1,239 @@
+// ============================================================
+// 远程遥控 v2 · 快手极速版适配（Auto.js 4.1.1 / Android 5.1）
+// 目标机型：vivo X6s A（SDK_INT=22，1080x1920）
+//
+// v2 相比 v1 的变化：
+//   1. 不再只找"标记可滚动"的节点，改为遍历全树 + 大容器暴力试滚动
+//      （快手极速版视频流是自绘 View，不标记 scrollable，v1 匹配不到）
+//   2. 节点树缓存 CACHE_MS，避免每条指令重复遍历导致 10~33 秒延迟
+//   3. 新增 dump 指令：把前 60 个节点类名/尺寸/可滚动标记打回 PC
+//   4. 新增 scan：只回报节点总数，代价极低
+//
+// 启动前：设置 → 辅助功能 → 开启 AutoJs 无障碍服务
+// 停止：音量减键 / cmd=stop
+// ============================================================
+
+// ==================== 配置 ====================
+var PC = "http://172.20.36.178:8000";
+var POLL = 500;          // 轮询间隔(ms)
+var CACHE_MS = 5000;     // 节点树缓存有效期(ms)
+var MAX_SCAN = 300;      // 单次最多收集节点数
+var HB_EVERY = 60000;    // 心跳间隔(ms)
+
+// ==================== HTTP ====================
+function httpText(path) {
+    var r = null;
+    try {
+        var sep = (path.indexOf("?") >= 0) ? "&" : "?";
+        r = http.get(PC + path + sep + "_t=" + Date.now(), {
+            headers: { "Cache-Control": "no-cache" }
+        });
+        if (!r || r.statusCode !== 200) return null;
+        return r.body.string();
+    } catch (e) {
+        return null;
+    }
+}
+
+// 长文本回报（节点 dump 用 POST，避免 URL 过长）
+function ackLong(msg) {
+    try {
+        http.post(PC + "/ack", msg, {
+            headers: { "Content-Type": "text/plain; charset=utf-8" }
+        });
+    } catch (e) {}
+    console.log(msg.substring(0, 200));
+}
+
+function ack(msg) {
+    ackLong(msg);
+}
+
+// ==================== 节点收集 ====================
+function shortName(cls) {
+    if (!cls) return "?";
+    var p = String(cls).split(".");
+    return p[p.length - 1];
+}
+
+var cache = { t: 0, nodes: [] };
+
+function collectAll() {
+    var out = [];
+    try {
+        var set = classNameMatches(".*").find();
+        var n = (set && set.size) ? set.size : 0;
+        for (var i = 0; i < n && out.length < MAX_SCAN; i++) {
+            var nd = set.get(i);
+            var w = 0, h = 0, area = 0, sb = false, cls = "?", kids = -1;
+            try {
+                var b = nd.bounds();
+                if (b) { w = b.width(); h = b.height(); area = Math.max(0, w) * Math.max(0, h); }
+            } catch (e) {}
+            if (area <= 0) continue;               // 跳过不可见节点
+            try { sb = nd.scrollable(); } catch (e) {}
+            try { cls = shortName(nd.className()); } catch (e) {}
+            try { kids = nd.childCount(); } catch (e) {}
+            out.push({ node: nd, cls: cls, w: w, h: h, area: area, sb: sb, kids: kids });
+        }
+    } catch (e) {}
+    return out;
+}
+
+function nodesCached() {
+    if (Date.now() - cache.t < CACHE_MS && cache.nodes.length) return cache.nodes;
+    cache.nodes = collectAll();
+    cache.t = Date.now();
+    return cache.nodes;
+}
+
+// ==================== 滚动：全树暴力尝试 ====================
+function tryScroll(forward) {
+    var nodes = nodesCached();
+    if (!nodes.length) return "失败:无障碍树为0节点(该页不暴露节点)";
+
+    var sw = 0, sh = 0;
+    try { sw = device.width; sh = device.height; } catch (e) {}
+    var minArea = sw * sh * 0.30;   // 第一轮只试大容器，避免误滚小列表
+
+    // 排序：scrollable 标记优先，其次面积从大到小
+    var idx = [];
+    for (var i = 0; i < nodes.length; i++) idx.push(i);
+    idx.sort(function (a, b) {
+        var sa = nodes[a].sb ? 1 : 0, sb2 = nodes[b].sb ? 1 : 0;
+        if (sa !== sb2) return sb2 - sa;
+        return nodes[b].area - nodes[a].area;
+    });
+
+    var tried = 0;
+    for (var pass = 0; pass < 2; pass++) {
+        for (var m = 0; m < idx.length; m++) {
+            var nd = nodes[idx[m]];
+            if (pass === 0 && nd.area < minArea) continue;
+            tried++;
+            var ok = false;
+            try { ok = forward ? nd.node.scrollForward() : nd.node.scrollBackward(); } catch (e) {}
+            if (ok) {
+                return "成功:" + nd.cls + "(" + nd.w + "x" + nd.h + ",sb=" + nd.sb +
+                       ") 第" + tried + "次 节点数=" + nodes.length;
+            }
+        }
+    }
+    return "失败:扫" + nodes.length + "节点/试" + tried + "次";
+}
+
+// ==================== 指令 ====================
+function wake() {
+    try { device.wakeUpIfNeeded(); } catch (e) {
+        try { device.wakeUp(); } catch (e2) {}
+    }
+    try { device.keepScreenOn(10 * 60 * 1000); } catch (e) {}
+}
+
+function dumpStr() {
+    var nodes = nodesCached();
+    var lim = nodes.length < 60 ? nodes.length : 60;
+    var parts = [];
+    for (var i = 0; i < lim; i++) {
+        var n = nodes[i];
+        parts.push(i + " " + n.cls + " sb=" + (n.sb ? 1 : 0) +
+                   " " + n.w + "x" + n.h + " k=" + n.kids);
+    }
+    return "DUMP 总节点=" + nodes.length + " 前台=" + currentPackage() + "\n" + parts.join("\n");
+}
+
+function doTap(arg) {
+    if (!arg) return "失败:tap 缺少文字参数";
+    var nd = null;
+    try { nd = text(arg).findOne(1500); } catch (e) {}
+    if (!nd) { try { nd = desc(arg).findOne(1000); } catch (e) {} }
+    if (!nd) return "失败:找不到文字=" + arg;
+    var ok = false;
+    try { ok = nd.click(); } catch (e) {}
+    return (ok ? "成功:点击 " : "失败:点击 ") + arg;
+}
+
+function run(cmd, arg) {
+    if (cmd === "dump") return dumpStr();
+    if (cmd === "scan") {
+        var ns = collectAll();      // 强制刷新，不用缓存
+        cache.nodes = ns; cache.t = Date.now();
+        return "节点数=" + ns.length + " 前台=" + currentPackage();
+    }
+    wake();
+    if (cmd === "up") {
+        return tryScroll(true);
+    }
+    if (cmd === "down") {
+        return tryScroll(false);
+    }
+    if (cmd === "tap") return doTap(arg);
+    if (cmd === "back") { try { back(); return "成功:back"; } catch (e) { return "失败:back"; } }
+    if (cmd === "home") { try { home(); return "成功:home"; } catch (e) { return "失败:home"; } }
+    if (cmd === "recents") { try { recents(); return "成功:recents"; } catch (e) { return "失败:recents"; } }
+    if (cmd === "status") {
+        var w = 0, h = 0;
+        try { w = device.width; h = device.height; } catch (e) {}
+        return "前台=" + currentPackage() + " 屏幕=" + w + "x" + h +
+               " 服务=" + (auto.service ? "开" : "关") + " 缓存节点=" + cache.nodes.length;
+    }
+    return "失败:未知指令 " + cmd;
+}
+
+// ==================== 停止键 ====================
+var stopped = false;
+try {
+    events.observeKey();
+    events.onKeyDown("volume_down", function (event) {
+        stopped = true;
+        ack("本地停止:音量减键");
+        engines.stopAll();
+        event.consumed = true;
+    });
+} catch (e) {}
+
+// ==================== 启动 ====================
+if (!auto.service) {
+    toast("无障碍服务未开启！设置→辅助功能→AutoJs");
+    exit();
+}
+toast("v2 已启动 | 轮询 " + PC);
+ack("上线 v2 脚本=remote_ctl_kuaishou_v2_20261023.js");
+
+// ==================== 主循环 ====================
+var lastHb = Date.now();
+var loopCount = 0;
+
+while (!stopped) {
+    loopCount++;
+
+    if (Date.now() - lastHb >= HB_EVERY) {
+        lastHb = Date.now();
+        ack("hb v2 循环=" + loopCount + " 前台=" + currentPackage() +
+            " 缓存节点=" + cache.nodes.length);
+    }
+
+    var body = httpText("/cmd");
+    if (body) {
+        var obj = null;
+        try { obj = JSON.parse(body); } catch (e) {}
+        if (obj && obj.cmd) {
+            if (obj.cmd === "stop") {
+                ack("远端停止 v2 seq=" + obj.seq);
+                toast("收到远端停止");
+                break;
+            }
+            var res = "";
+            try {
+                res = run(obj.cmd, obj.arg);
+            } catch (e2) {
+                res = "异常:" + e2;
+            }
+            ack("seq=" + obj.seq + " cmd=" + obj.cmd + " => " + res);
+        }
+    }
+
+    sleep(POLL);
+}
+
+ack("v2 脚本已退出");

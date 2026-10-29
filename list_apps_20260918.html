@@ -1,0 +1,81 @@
+// ============================================================
+// 列出手机里所有应用（一次性，2 秒跑完，不用切 App）
+// 生成时间：2026-09-18
+// 结果：悬浮控制台 + /sdcard/app_list.txt + 自动回传电脑
+// 退出：音量减键
+// ============================================================
+
+var PC_URL = "http://172.20.36.178:8099/upload";
+
+var lines = [];
+function log(s) { lines.push("" + s); console.log("" + s); }
+
+// ---------- 设备信息（含硬件明细） ----------
+try {
+    log("机型: " + device.brand + " " + device.model +
+        " | Android " + device.release + " (SDK" + device.sdkInt + ")");
+} catch (e) { log("设备信息读取失败: " + e); }
+try {
+    importClass(android.os.Build);
+    log("指纹: " + Build.FINGERPRINT);
+    log("主板: " + Build.BOARD + " | 平台: " + Build.HARDWARE + " | 设备: " + Build.DEVICE);
+    log("厂商/型号: " + Build.MANUFACTURER + " / " + Build.MODEL);
+} catch (e) { log("Build 读取失败: " + e); }
+try {
+    importClass(android.app.ActivityManager);
+    var am = context.getSystemService(context.ACTIVITY_SERVICE);
+    var mi = new ActivityManager.MemoryInfo();
+    am.getMemoryInfo(mi);
+    log("内存: " + Math.round(mi.totalMem / 1048576) + " MB (可用 " +
+        Math.round(mi.availMem / 1048576) + " MB)");
+} catch (e) { log("内存读取失败: " + e); }
+try {
+    var cpu = files.read("/proc/cpuinfo");
+    var ls = cpu.split("\n");
+    for (var i = 0; i < ls.length; i++) {
+        if (/Hardware|Processor|model name/i.test(ls[i])) log("CPU: " + ls[i].trim());
+    }
+} catch (e) { log("cpuinfo 读取失败: " + e); }
+
+// ---------- 应用列表 ----------
+var user = [], sys = [];
+try {
+    var pm = context.getPackageManager();
+    var infos = pm.getInstalledApplications(0);
+    for (var i = 0; i < infos.size(); i++) {
+        var ai = infos.get(i);
+        var label = "", pkg = "?";
+        try { label = String(pm.getApplicationLabel(ai)); } catch (e) {}
+        try { pkg = String(ai.packageName); } catch (e) {}
+        var isSys = false;
+        try { isSys = ((ai.flags & 1) === 1); } catch (e) {}   // FLAG_SYSTEM = 1
+        var row = label + " | " + pkg;
+        if (isSys) sys.push(row); else user.push(row);
+    }
+} catch (e) { log("读取应用列表失败: " + e); }
+
+user.sort(); sys.sort();
+log("共 " + (user.length + sys.length) + " 个应用（用户安装 " + user.length + " / 系统 " + sys.length + "）");
+log("===== 用户安装的应用 =====");
+for (var i = 0; i < user.length; i++) log(user[i]);
+log("===== 系统应用 =====");
+for (var i = 0; i < sys.length; i++) log(sys[i]);
+
+// ---------- 保存 + 回传 ----------
+try {
+    files.write("/sdcard/app_list.txt", lines.join("\n"));
+    log("已保存: /sdcard/app_list.txt");
+} catch (e) { log("保存文件失败: " + e); }
+try {
+    var resp = http.post(PC_URL, lines.join("\n"), { contentType: "text/plain", charset: "utf-8" });
+    log("已回传电脑: HTTP " + resp.statusCode);
+    toast("应用列表已回传电脑 ✓");
+} catch (e) { log("回传电脑失败: " + e); toast("回传失败: " + e); }
+
+// ---------- 显示并保持 ----------
+try { console.show(); console.setSize(0.96, 0.6); } catch (e) {}
+toast("列完了，音量减键退出");
+
+events.observeKey();
+events.onKeyDown("volume_down", function (event) { engines.stopAll(); event.consumed = true; });
+while (true) sleep(1000);
